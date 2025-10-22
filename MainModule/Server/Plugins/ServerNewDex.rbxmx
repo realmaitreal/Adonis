@@ -69,89 +69,260 @@
 	ServerNewDex.newDex_main = newDex_main
 	ServerNewDex.Event = nil;
 	ServerNewDex.Authorized = {}; --// Users who have been given Dex and are authorized to use the remote event
+	ServerNewDex.InstanceCache = {}; --// Cache for server-side instance references
+	local nextInstanceId = 1
+
+	-- Helper function to cache an instance and return its ID
+	local function cacheInstance(player, instance)
+		if not ServerNewDex.InstanceCache[player] then
+			ServerNewDex.InstanceCache[player] = {}
+		end
+
+		-- Check if instance is already cached
+		for id, cachedInst in pairs(ServerNewDex.InstanceCache[player]) do
+			if cachedInst == instance then
+				return id
+			end
+		end
+
+		-- Cache new instance
+		local id = "server_" .. tostring(nextInstanceId)
+		nextInstanceId = nextInstanceId + 1
+		ServerNewDex.InstanceCache[player][id] = instance
+		return id
+	end
+
+	-- Helper function to get instance from cache or use direct reference
+	local function getInstance(player, ref)
+		if type(ref) == "string" and string.sub(ref, 1, 7) == "server_" then
+			-- It's a cached server-side instance
+			if ServerNewDex.InstanceCache[player] then
+				return ServerNewDex.InstanceCache[player][ref]
+			end
+			return nil
+		else
+			-- It's a direct instance reference from client
+			return ref
+		end
+	end
 
 	local Actions = {
 		destroy = function(p: Player, args)
-			args[1]:Destroy();
-			return true;
+			local obj = getInstance(p, args[1])
+			if obj then
+				obj:Destroy();
+				return true;
+			end
+			return false;
 		end,
 		clearclipboard = function(Player: Player, args)
 			Player.Clipboard = {};
 			return true;
 		end,
 		duplicate = function(Player: Player, args)
-			local obj = args[1];
-			local par = args[2];
+			local obj = getInstance(Player, args[1]);
+			local par = getInstance(Player, args[2]);
 
-			local new = obj:Clone()
-			new.Parent = par;
-
-			return new;
+			if obj and par then
+				local new = obj:Clone()
+				new.Parent = par;
+				return new;
+			end
+			return nil;
 		end,
 		copy = function(Player: Player, args)
-			local obj = args[1];
-			local new = obj:Clone();
-			table.insert(Player.Clipboard, new)
-
-			return new; -- It seems like this returns nil to the client, if the parent is nil.
+			local obj = getInstance(Player, args[1]);
+			if obj then
+				local new = obj:Clone();
+				table.insert(Player.Clipboard, new)
+				return new; -- It seems like this returns nil to the client, if the parent is nil.
+			end
+			return nil;
 		end,
 		paste = function(Player: Player, args)
-			local parent = args[1];
+			local parent = getInstance(Player, args[1]);
 			local pastedObjects = {}
 
-			for _,v in pairs(Player.Clipboard) do
-				local cloned = v:Clone()
-				cloned.Parent = parent;
-				table.insert(pastedObjects, cloned)
+			if parent then
+				for _,v in pairs(Player.Clipboard) do
+					local cloned = v:Clone()
+					cloned.Parent = parent;
+					table.insert(pastedObjects, cloned)
+				end
 			end
 
 			return pastedObjects;
 		end,
 		setproperty = function(Player: Player, args)
-			local obj = args[1];
+			local obj = getInstance(Player, args[1]);
 			local prop = args[2];
 			local value = args[3];
 
-			if value ~= nil then
+			if obj and value ~= nil then
+				-- If value is an instance reference, resolve it
+				if type(value) == "string" and string.sub(value, 1, 7) == "server_" then
+					value = getInstance(Player, value)
+				end
 				obj[prop] = value;
 				return true;
 			end
+			return false;
 		end,
 		setpropertyattribute = function(Player:Player, args)
-			local obj = args[1];
+			local obj = getInstance(Player, args[1]);
 			local attributeName = args[2];
 			local value = args[3];
 
-			if (value ~= nil) then
+			if obj and (value ~= nil) then
 				obj:SetAttribute(attributeName, value);
 				return true;
 			end
+			return false;
 		end,
 		instancenew = function(Player:Player, args)
-			return Service.New(args[1], args[2]);
-		end, 
+			local parent = getInstance(Player, args[2])
+			return Service.New(args[1], parent);
+		end,
 		callfunction = function(Player:Player, args)
-			local rets = {pcall(function() return (args[1][args[2]](args[1])) end)}
-			table.remove(rets,1)
-			return rets
-		end, 
-		callremote = function(Player:Player, args)
-			if args[1]:IsA("RemoteFunction") then
-				return args[1]:InvokeClient(table.unpack(args[2]))
-			elseif args[1]:IsA("RemoteEvent") then
-				args[1]:FireClient(table.unpack(args[2]))
-			elseif args[1]:IsA("BindableFunction") then
-				return args[1]:Invoke(table.unpack(args[2]))
-			elseif args[1]:IsA("BindableEvent") then
-				args[1]:Fire(table.unpack(args[2]))
+			local obj = getInstance(Player, args[1])
+			if obj then
+				local rets = {pcall(function() return (obj[args[2]](obj)) end)}
+				table.remove(rets,1)
+				return rets
 			end
+			return {false, "Instance not found"}
+		end,
+		callremote = function(Player:Player, args)
+			local obj = getInstance(Player, args[1])
+			if obj then
+				if obj:IsA("RemoteFunction") then
+					return obj:InvokeClient(table.unpack(args[2]))
+				elseif obj:IsA("RemoteEvent") then
+					obj:FireClient(table.unpack(args[2]))
+				elseif obj:IsA("BindableFunction") then
+					return obj:Invoke(table.unpack(args[2]))
+				elseif obj:IsA("BindableEvent") then
+					obj:Fire(table.unpack(args[2]))
+				end
+			end
+			return nil
 		end,
 		fetchapi = function(Player:Player)
 			return APIDump or false
 		end,
 		fetchrmd = function(Player:Player)
 			return Reflection or false
-		end, 
+		end,
+		-- Server-side exploration actions
+		getservice = function(Player:Player, args)
+			local serviceName = args[1]
+			local success, service = pcall(function()
+				return game:GetService(serviceName)
+			end)
+			if success and service then
+				local id = cacheInstance(Player, service)
+				return {
+					Success = true,
+					InstanceId = id,
+					Name = service.Name,
+					ClassName = service.ClassName,
+					IsService = true
+				}
+			end
+			return {Success = false}
+		end,
+		getchildren = function(Player:Player, args)
+			local instanceRef = args[1]
+			local instance = getInstance(Player, instanceRef)
+
+			if not instance then
+				return {Success = false, Error = "Instance not found"}
+			end
+
+			local children = {}
+			local success, result = pcall(function()
+				for _, child in ipairs(instance:GetChildren()) do
+					local id = cacheInstance(Player, child)
+					table.insert(children, {
+						InstanceId = id,
+						Name = child.Name,
+						ClassName = child.ClassName
+					})
+				end
+			end)
+
+			if success then
+				return {Success = true, Children = children}
+			else
+				return {Success = false, Error = tostring(result)}
+			end
+		end,
+		getproperty = function(Player:Player, args)
+			local instanceRef = args[1]
+			local propertyName = args[2]
+			local instance = getInstance(Player, instanceRef)
+
+			if not instance then
+				return {Success = false, Error = "Instance not found"}
+			end
+
+			local success, value = pcall(function()
+				return instance[propertyName]
+			end)
+
+			if success then
+				-- Handle instance references specially
+				if typeof(value) == "Instance" then
+					local id = cacheInstance(Player, value)
+					return {
+						Success = true,
+						Value = value,
+						InstanceId = id,
+						Type = "Instance"
+					}
+				else
+					return {Success = true, Value = value, Type = typeof(value)}
+				end
+			else
+				return {Success = false, Error = tostring(value)}
+			end
+		end,
+		getgame = function(Player:Player, args)
+			local id = cacheInstance(Player, game)
+			return {
+				Success = true,
+				InstanceId = id,
+				Name = "game",
+				ClassName = "DataModel"
+			}
+		end,
+		getdescendants = function(Player:Player, args)
+			local instanceRef = args[1]
+			local instance = getInstance(Player, instanceRef)
+
+			if not instance then
+				return {Success = false, Error = "Instance not found"}
+			end
+
+			local descendants = {}
+			local success, result = pcall(function()
+				for _, descendant in ipairs(instance:GetDescendants()) do
+					local id = cacheInstance(Player, descendant)
+					table.insert(descendants, {
+						InstanceId = id,
+						Name = descendant.Name,
+						ClassName = descendant.ClassName,
+						Parent = descendant.Parent and descendant.Parent.Name or nil
+					})
+				end
+			end)
+
+			if success then
+				return {Success = true, Descendants = descendants}
+			else
+				return {Success = false, Error = tostring(result)}
+			end
+		end,
 	}
 
 	function ServerNewDex.MakeEvent()
@@ -204,7 +375,7 @@
 		Prefix = Settings.Prefix;
 		Commands = {"dexnew";"dexnewexplorer";"newdex";"dex";"dexexplorer"};
 		Args = {};	--// kept for backwards compatibility
-		Description = "Lets you explore the game using new Dex [Credits to LorekeeperZinnia]";
+		Description = "Lets you explore the game using new Dex with full server-side access to ServerScriptService, ServerStorage, etc. [Credits to LorekeeperZinnia]";
 		AdminLevel = 300;
 		Function = function(plr, args)
 			ServerNewDex.Authorized[plr] = {
@@ -215,7 +386,18 @@
 			Remote.MakeLocal(plr, newDex_main:Clone(), "PlayerGui")
 		end
 	};
-	Logs:AddLog("Script", "NewDex Module Loaded")
+
+	-- Cleanup cache when player leaves
+	service.Players.PlayerRemoving:Connect(function(player)
+		if ServerNewDex.InstanceCache[player] then
+			ServerNewDex.InstanceCache[player] = nil
+		end
+		if ServerNewDex.Authorized[player] then
+			ServerNewDex.Authorized[player] = nil
+		end
+	end)
+
+	Logs:AddLog("Script", "NewDex Module Loaded (Server-side mode enabled)")
 end]]></ProtectedString>
 			<int64 name="SourceAssetId">-1</int64>
 			<BinaryString name="Tags"></BinaryString>
